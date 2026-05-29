@@ -1,0 +1,6 @@
+{
+  "name": "UNO Multiplayer",
+  "description": "A WebRTC-based peer-to-peer multiplayer UNO card game. Players can create rooms, show a joining QR code, scan the QR code to join in real-time, and run fully persistent or synchronized game state over RTC data channels.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

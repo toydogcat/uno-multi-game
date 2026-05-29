@@ -1,36 +1,45 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-
-# dependencies
-/node_modules
-/.pnp
-.pnp.js
-
-# testing
-/coverage
-
-# next.js
-/.next/
-/out/
-
-# production
-/build
-
-# misc
-.DS_Store
-*.pem
-
-# debug
+# Logs
+logs
+*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# local env files
-.env*.local
-.env
+# Dependency directories
+node_modules/
 
-# vercel
-.vercel
-
-# typescript
+# Build outputs
+dist/
+build/
 *.tsbuildinfo
-next-env.d.ts
+
+# Coverage directory used by tools like istanbul
+coverage/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+!.env.example
+
+# IDE / Editor configurations
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# Project specific temporary and large files (Mandated by developer_guide.md)
+TMP/
+temp/
+*.pdf
+*.mp4
+*.zip
+!TMP/todo.md
+!TMP/developer_guide.md
