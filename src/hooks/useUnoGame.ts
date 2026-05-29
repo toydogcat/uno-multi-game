@@ -1,8 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Card, CardColor, GameState, HostGameState, Player, ClientMessage, HostMessage } from "../types";
 import { createUnoDeck, shuffleDeck, isCardPlayable } from "../utils/cardUtils";
-
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "";
+import mqtt from "mqtt";
 
 const STUN_SERVERS = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
@@ -37,7 +36,20 @@ export function useUnoGame() {
   // Host Authoritative state ref (Only loaded on Host client)
   const hostState = useRef<HostGameState | null>(null);
 
-  // Utility to send signaling message via HTTP to our Express server
+  // MQTT client ref for signaling
+  const mqttClient = useRef<any>(null);
+
+  // Helper to generate unique short IDs
+  const generateId = (length = 6): string => {
+    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let result = "";
+    for (let i = 0; i < length; i++) {
+      result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+  };
+
+  // Utility to send signaling message via MQTT
   const sendSignal = async (
     rId: string,
     fromId: string,
@@ -45,14 +57,15 @@ export function useUnoGame() {
     type: string,
     data: any
   ) => {
-    try {
-      await fetch(`${API_BASE}/api/rooms/${rId}/signal`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ from: fromId, to: toId, type, data }),
-      });
-    } catch (e) {
-      console.error("Failed to send Signal", e);
+    if (mqttClient.current && mqttClient.current.connected) {
+      const topic = `luna/uno/${rId}/signal/${toId}`;
+      mqttClient.current.publish(
+        topic,
+        JSON.stringify({ from: fromId, to: toId, type, data })
+      );
+      console.debug("Sent MQTT signal:", type, "to", toId);
+    } else {
+      console.warn("MQTT client not connected, failed to send signal:", type);
     }
   };
 
@@ -113,31 +126,198 @@ export function useUnoGame() {
     });
   }, [isHost, playerId]);
 
-  // REST endpoints integration
+  // MQTT signaling orchestration
+  const initMqttSignaling = (rId: string, pId: string, pName: string, hostFlag: boolean) => {
+    const brokerUrl = "wss://broker.emqx.io:8084/mqtt";
+    const clientId = `luna_uno_${hostFlag ? "host" : "guest"}_${pId}_${Math.random().toString(16).substr(2, 6)}`;
+    
+    try {
+      mqttClient.current = mqtt.connect(brokerUrl, {
+        clientId,
+        clean: true,
+        connectTimeout: 4000,
+        reconnectPeriod: 2000,
+      });
+
+      const client = mqttClient.current;
+
+      client.on("connect", () => {
+        console.log("Connected to EMQX MQTT signaling broker successfully!");
+        
+        if (hostFlag) {
+          client.subscribe(`luna/uno/${rId}/join`);
+          client.subscribe(`luna/uno/${rId}/leave`);
+          client.subscribe(`luna/uno/${rId}/signal/${pId}`);
+          setWebrtcStatus("房間成功創建！等待玩家加入 🤝");
+        } else {
+          client.subscribe(`luna/uno/${rId}/lobby_sync`);
+          client.subscribe(`luna/uno/${rId}/start`);
+          client.subscribe(`luna/uno/${rId}/signal/${pId}`);
+          setWebrtcStatus("已進入房間大廳，正在與房主建立 WebRTC 連線...");
+
+          // Publish join request to Host
+          client.publish(
+            `luna/uno/${rId}/join`,
+            JSON.stringify({ id: pId, name: pName.trim(), isHost: false })
+          );
+        }
+      });
+
+      client.on("message", async (topic: string, message: any) => {
+        try {
+          const payload = JSON.parse(message.toString());
+          console.debug("Received MQTT message on", topic, payload);
+
+          // 1. Host processes a Guest joining
+          if (topic === `luna/uno/${rId}/join` && hostFlag) {
+            setLobbyPlayers((prev) => {
+              if (prev.find((p) => p.id === payload.id)) return prev;
+              const updated = [...prev, payload];
+              // Sync updated lobby with all guests
+              client.publish(`luna/uno/${rId}/lobby_sync`, JSON.stringify(updated));
+              return updated;
+            });
+          }
+
+          // 2. Host processes a Guest leaving
+          else if (topic === `luna/uno/${rId}/leave` && hostFlag) {
+            setLobbyPlayers((prev) => {
+              const updated = prev.filter((p) => p.id !== payload.playerId);
+              // Sync updated lobby with all guests
+              client.publish(`luna/uno/${rId}/lobby_sync`, JSON.stringify(updated));
+              return updated;
+            });
+
+            // Close P2P connection
+            const pc = peerConnections.current[payload.playerId];
+            if (pc) {
+              pc.close();
+              delete peerConnections.current[payload.playerId];
+            }
+            delete dataChannels.current[payload.playerId];
+          }
+
+          // 3. Guest processes updated lobby sync list
+          else if (topic === `luna/uno/${rId}/lobby_sync` && !hostFlag) {
+            setLobbyPlayers(payload);
+          }
+
+          // 4. Guest processes game started trigger
+          else if (topic === `luna/uno/${rId}/start` && !hostFlag) {
+            setIsStarted(true);
+          }
+
+          // 5. Incoming signaling handshake (offer, answer, candidate)
+          else if (topic === `luna/uno/${rId}/signal/${pId}`) {
+            if (hostFlag) {
+              const peerId = payload.from;
+              const pc = peerConnections.current[peerId];
+              if (pc) {
+                if (payload.type === "answer") {
+                  await pc.setRemoteDescription(new RTCSessionDescription(payload.data));
+                  console.log(`Coupled WebRTC handshake answer for Peer ${peerId}`);
+                } else if (payload.type === "candidate") {
+                  try {
+                    await pc.addIceCandidate(new RTCIceCandidate(payload.data));
+                  } catch (err) {
+                    console.warn("Host candidate adding warning:", err);
+                  }
+                }
+              }
+            } else {
+              // Guest receiving signaling from Host
+              if (payload.type === "offer") {
+                const pc = new RTCPeerConnection(STUN_SERVERS);
+                peerConnectionSingle.current = pc;
+                setWebrtcStatus("收到房主 Offer... 建立並回覆 Answer 連線。");
+
+                pc.ondatachannel = (event) => {
+                  const dc = event.channel;
+                  dataChannelSingle.current = dc;
+                  setWebrtcStatus("與房主的 P2P DataChannel 接通！等待遊戲開始... ⚡");
+
+                  dc.onopen = () => {
+                    console.log("Client RTC Channel Open with Host.");
+                    dc.send(JSON.stringify({ type: "PING" }));
+                  };
+
+                  dc.onclose = () => {
+                    console.warn("Client RTC Channel Closed");
+                  };
+
+                  dc.onmessage = (e) => {
+                    try {
+                      const payloadState = JSON.parse(e.data);
+                      if (payloadState.type === "STATE_UPDATE") {
+                        setGameState(payloadState.state);
+                        setIsStarted(payloadState.state.isStarted);
+                      }
+                    } catch (err) {
+                      console.error("Client parsing rtc state failed", err);
+                    }
+                  };
+                };
+
+                pc.onicecandidate = (e) => {
+                  if (e.candidate) {
+                    sendSignal(rId, pId, payload.from, "candidate", e.candidate);
+                  }
+                };
+
+                await pc.setRemoteDescription(new RTCSessionDescription(payload.data));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+
+                await sendSignal(rId, pId, payload.from, "answer", answer);
+              } else if (payload.type === "candidate" && peerConnectionSingle.current) {
+                try {
+                  await peerConnectionSingle.current.addIceCandidate(new RTCIceCandidate(payload.data));
+                } catch (err) {
+                  console.warn("Guest candidate adding warning:", err);
+                }
+              }
+            }
+          }
+        } catch (e) {
+          console.error("Error parsing MQTT payload:", e);
+        }
+      });
+
+      client.on("error", (err: any) => {
+        console.error("MQTT client error:", err);
+        setWebrtcStatus("連線服務出錯，請重試。");
+      });
+    } catch (e) {
+      console.error("Failed to connect MQTT:", e);
+    }
+  };
+
+  // REST endpoints integration replaced by local frontend logic and MQTT setup
   const createRoom = async (name: string) => {
     if (!name.trim()) return;
     setIsConnecting(true);
     setWebrtcStatus("正在創建房間...");
     try {
-      const response = await fetch(`${API_BASE}/api/rooms/create`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ hostName: name.trim() }),
-      });
-      const data = await response.json();
-      if (data.error) {
-        alert(data.error);
-        setIsConnecting(false);
-        return;
-      }
-      setRoomId(data.roomId);
-      setPlayerId(data.playerId);
+      const generatedRoomId = generateId(5);
+      const generatedPlayerId = generateId(8);
+      
+      setRoomId(generatedRoomId);
+      setPlayerId(generatedPlayerId);
       setPlayerName(name.trim());
       setIsHost(true);
-      setWebrtcStatus("房間成功創建！等待玩家加入 🤝");
+      
+      setLobbyPlayers([
+        {
+          id: generatedPlayerId,
+          name: name.trim(),
+          isHost: true,
+        },
+      ]);
+      
+      initMqttSignaling(generatedRoomId, generatedPlayerId, name.trim(), true);
     } catch (err) {
       console.error(err);
-      setWebrtcStatus("無法連接到伺服器。請稍後重試。");
+      setWebrtcStatus("房間創建失敗。請重試。");
     } finally {
       setIsConnecting(false);
     }
@@ -149,26 +329,19 @@ export function useUnoGame() {
     setWebrtcStatus("尋找並加入房間中...");
     const cleanRId = rId.toUpperCase().trim();
     try {
-      const response = await fetch(`${API_BASE}/api/rooms/join`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ roomId: cleanRId, playerName: name.trim() }),
-      });
-      const data = await response.json();
-      if (data.error) {
-        alert(data.error);
-        setIsConnecting(false);
-        setWebrtcStatus("");
-        return;
-      }
+      const generatedPlayerId = generateId(8);
+      
       setRoomId(cleanRId);
-      setPlayerId(data.playerId);
+      setPlayerId(generatedPlayerId);
       setPlayerName(name.trim());
       setIsHost(false);
-      setWebrtcStatus("已進入房間大廳，正在與房主建立 WebRTC 連線...");
+      
+      initMqttSignaling(cleanRId, generatedPlayerId, name.trim(), false);
     } catch (err) {
       console.error(err);
-      setWebrtcStatus("連線失敗。請檢查代碼或網路狀況。");
+      setWebrtcStatus("加入房間失敗。");
+      setIsConnecting(false);
+    } finally {
       setIsConnecting(false);
     }
   };
@@ -176,15 +349,27 @@ export function useUnoGame() {
   const leaveRoom = async () => {
     if (roomId && playerId) {
       try {
-        await fetch(`${API_BASE}/api/rooms/${roomId}/leave`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ playerId }),
-        });
+        if (mqttClient.current && mqttClient.current.connected) {
+          mqttClient.current.publish(
+            `luna/uno/${roomId}/leave`,
+            JSON.stringify({ playerId })
+          );
+        }
       } catch (err) {
         console.error(err);
       }
     }
+    
+    // Close MQTT connection
+    if (mqttClient.current) {
+      try {
+        mqttClient.current.end();
+      } catch (err) {
+        console.error(err);
+      }
+      mqttClient.current = null;
+    }
+
     // Release RTC Peerconnections
     (Object.values(peerConnections.current) as any[]).forEach((pc) => {
       if (pc && typeof pc.close === "function") {
@@ -213,15 +398,12 @@ export function useUnoGame() {
   const startGame = useCallback(async () => {
     if (!isHost || !roomId || !playerId) return;
     try {
-      const res = await fetch(`${API_BASE}/api/rooms/${roomId}/lock`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ playerId }),
-      });
-      const data = await res.json();
-      if (data.error) {
-        alert(data.error);
-        return;
+      // Notify guests via MQTT that the game is starting and lobby is locked
+      if (mqttClient.current && mqttClient.current.connected) {
+        mqttClient.current.publish(
+          `luna/uno/${roomId}/start`,
+          JSON.stringify({ locked: true })
+        );
       }
 
       // Initialize UNO Deck & Shuffling
@@ -549,156 +731,8 @@ export function useUnoGame() {
   };
 
   // ---------------------------------------------------------------------------
-  // Connection Signaling Orchestration EFFECT Loops (Interval polling)
+  // Connection Signaling Orchestration (MQTT Real-Time Push Handshake)
   // ---------------------------------------------------------------------------
-
-  // Loop A: Lobby check for Host and Guest
-  useEffect(() => {
-    if (!roomId) return;
-
-    const pullLobbyData = async () => {
-      try {
-        const response = await fetch(`${API_BASE}/api/rooms/${roomId}/players`);
-        if (response.ok) {
-          const data = await response.json();
-          setLobbyPlayers(data.players || []);
-          
-          // Sync start state
-          if (!isHost && data.locked) {
-            setIsStarted(true);
-          }
-        }
-      } catch (err) {
-        console.error("Error polling room lobby players:", err);
-      }
-    };
-
-    pullLobbyData();
-    const interval = setInterval(pullLobbyData, 1500);
-    return () => clearInterval(interval);
-  }, [roomId, isHost]);
-
-  // Loop B: Guest signaling receiver (Listen for Host WebRTC connections and candidates)
-  useEffect(() => {
-    if (isHost || !roomId || !playerId) return;
-
-    let rtcConnected = false;
-    const pollSignals = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/rooms/${roomId}/signals/${playerId}`);
-        if (!res.ok) return;
-
-        const data = await res.json();
-        const incoming = data.signals || [];
-
-        for (const sig of incoming) {
-          console.debug("Guest received signaling:", sig.type);
-
-          if (sig.type === "offer") {
-            const pc = new RTCPeerConnection(STUN_SERVERS);
-            peerConnectionSingle.current = pc;
-            setWebrtcStatus("收到房聯協議 Offer... 建立並回覆 Answer 連線。");
-
-            // Setup direct dynamic DataChannel
-            pc.ondatachannel = (event) => {
-              const dc = event.channel;
-              dataChannelSingle.current = dc;
-              setWebrtcStatus("與房主的 P2P DataChannel 接通！等待遊戲開始... ⚡");
-
-              dc.onopen = () => {
-                console.log("Client RTC Channel Open with Host.");
-                // Immediately register player identity link to Host
-                dc.send(JSON.stringify({ type: "PING" }));
-              };
-
-              dc.onclose = () => {
-                console.warn("Client RTC Channel Closed");
-              };
-
-              // Main Client payload pipeline: Receives State broadcasts from Host
-              dc.onmessage = (e) => {
-                try {
-                  const payload = JSON.parse(e.data);
-                  if (payload.type === "STATE_UPDATE") {
-                    setGameState(payload.state);
-                    setIsStarted(payload.state.isStarted);
-                  }
-                } catch (err) {
-                  console.error("Client parsing rtc state failed", err);
-                }
-              };
-            };
-
-            // ICE Candidates dispatch back to Host
-            pc.onicecandidate = (e) => {
-              if (e.candidate) {
-                sendSignal(roomId, playerId, sig.from, "candidate", e.candidate);
-              }
-            };
-
-            // Build RTC Connection Answers
-            await pc.setRemoteDescription(new RTCSessionDescription(sig.data));
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-
-            await sendSignal(roomId, playerId, sig.from, "answer", answer);
-          } else if (sig.type === "candidate" && peerConnectionSingle.current) {
-            try {
-              await peerConnectionSingle.current.addIceCandidate(new RTCIceCandidate(sig.data));
-            } catch (err) {
-              console.warn("Guest candidate adding warning:", err);
-            }
-          }
-        }
-      } catch (err) {
-        console.error("Guest signaling pull failed:", err);
-      }
-    };
-
-    const interval = setInterval(() => {
-      if (!rtcConnected) pollSignals();
-    }, 1500);
-    return () => clearInterval(interval);
-  }, [roomId, playerId, isHost]);
-
-  // Loop C: Host signaling coordinator (Waits for answer/ICE candidates and initiates guest offers)
-  useEffect(() => {
-    if (!isHost || !roomId || !playerId) return;
-
-    const pullGuestSignals = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/rooms/${roomId}/signals/${playerId}`);
-        if (!res.ok) return;
-
-        const data = await res.json();
-        const incoming = data.signals || [];
-
-        for (const sig of incoming) {
-          console.debug("Host received signaling:", sig.type);
-          const peerId = sig.from;
-          const pc = peerConnections.current[peerId];
-
-          if (pc) {
-            if (sig.type === "answer") {
-              await pc.setRemoteDescription(new RTCSessionDescription(sig.data));
-              console.log(`Successfully coupled WebRTC RTC handshake answer with Peer ${peerId}`);
-            } else if (sig.type === "candidate") {
-              try {
-                await pc.addIceCandidate(new RTCIceCandidate(sig.data));
-              } catch (err) {
-                console.warn("Host candidate adding warning:", err);
-              }
-            }
-          }
-        }
-      } catch (err) {
-        console.error("Host signaling pull failed:", err);
-      }
-    };
-
-    const interval = setInterval(pullGuestSignals, 1500);
-    return () => clearInterval(interval);
-  }, [roomId, playerId, isHost]);
 
   // Loop D: Host scanning Lobby list to invite newcomer guests
   useEffect(() => {
