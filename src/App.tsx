@@ -114,6 +114,11 @@ export default function App() {
   const onScanSuccess = (scannedRoomId: string) => {
     setInputRoomId(scannedRoomId);
     setShowScanner(false);
+    if (!inputName.trim()) {
+      alert("請先輸入您的暱稱，再加入房間");
+      return;
+    }
+    joinRoom(scannedRoomId, inputName);
   };
 
   // Helper to color log lines elegantly
@@ -232,6 +237,25 @@ export default function App() {
               </div>
             </div>
 
+            {inputRoomId && (
+              <div className="bg-[#0054A6]/10 border-2 border-[#0054A6]/30 p-4 rounded-2xl flex items-center justify-between text-sm font-bold text-[#0054A6] animate-in fade-in slide-in-from-top-2 duration-200">
+                <span className="flex items-center gap-1.5 text-left">
+                  <span className="relative flex h-2 w-2 shrink-0">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#ED1C24] opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-[#ED1C24]"></span>
+                  </span>
+                  <span>已偵測到房間代碼：<strong className="text-[#ED1C24] font-black tracking-widest text-base">{inputRoomId}</strong></span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setInputRoomId("")}
+                  className="text-xs font-black text-[#ED1C24] bg-white border-2 border-[#ED1C24]/30 px-3 py-1.5 rounded-xl hover:bg-red-50 transition-all cursor-pointer shadow-sm shrink-0"
+                >
+                  清除並切換
+                </button>
+              </div>
+            )}
+
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 mt-2">
               {/* Host Action */}
               <form onSubmit={handleCreate} className="flex flex-col">
@@ -253,12 +277,16 @@ export default function App() {
                     alert("請先輸入您的暱稱，再加入房間");
                     return;
                   }
-                  setShowScanner(true);
+                  if (inputRoomId.trim()) {
+                    joinRoom(inputRoomId, inputName);
+                  } else {
+                    setShowScanner(true);
+                  }
                 }}
                 className="bg-[#0054A6] hover:bg-blue-700 hover:scale-[1.02] active:scale-95 text-white py-4 px-6 rounded-2xl font-black text-base shadow-xl border-b-4 border-blue-900 transition-all flex items-center justify-center gap-2 cursor-pointer uppercase italic"
               >
                 <QrCode size={18} className="stroke-[3]" />
-                加入房間 (掃碼/代碼)
+                {inputRoomId.trim() ? `加入房間 (${inputRoomId})` : "加入房間 (掃碼/代碼)"}
               </button>
             </div>
 
